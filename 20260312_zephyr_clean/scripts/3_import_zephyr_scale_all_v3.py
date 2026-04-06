@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+3_import_zephyr_scale_all_v4.py
+Import Zephyr Scale test cases, plans, and runs into a Jira Data Center target instance.
+Uses centralized configuration from config_loader.py.
+"""
+
+import json
+import os
+import time
+from config_loader import (
+    TARGET_BASE_URL,
+    TARGET_PAT,
+    TARGET_PROJECT_KEY,
+    TLS_CONFIG,
+    create_session,
+    EXPORT_DIR,
+)
+
+# ========= FILE PATHS =========
+IN_FILE = os.path.join(EXPORT_DIR, "zephyr_scale_full_clean.json")
+# ==============================
+
+session = create_session(TARGET_PAT)
+session.verify = TLS_CONFIG["verify"]
+session.cert = TLS_CONFIG["cert"]
+
+print(f"🌐 Target Jira: {TARGET_BASE_URL}")
+print(f"📁 Project Key: {TARGET_PROJECT_KEY}")
+print(f"📥 Import File: {IN_FILE}")
+
+# ---- Target endpoints ----
+TC_POST = f"{TARGET_BASE_URL}/rest/atm/1.0/testcase"
+PLAN_POST = f"{TARGET_BASE_URL}/rest/atm/1.0/testplan"
+RUN_POST = f"{TARGET_BASE_URL}/rest/atm/1.0/testrun"
+RESULTS_POST = f"{TARGET_BASE_URL}/rest/atm/1.0/testrun"
+
+# ======= CREATE FOLDERS ==========
+FOLDER_CACHE = set()
+
+def ensure_folder_exists(folder_path):
+    """Ensure a folder path exists in Zephyr Scale (Jira DC)."""
+    if not folder_path:
+        return None
+    if folder_path in FOLDER_CACHE:
+        return folder_path
+
+    try:
+        parts = [p for p in folder_path.strip("/").split("/") if p]
+        current_path = ""
+        for part in parts:
+            current_path = f"{current_path}/{part}" if current_path else part
+            if current_path in FOLDER_CACHE:
+                continue
+
+            list_url = f"{TARGET_BASE_URL}/rest/atm/1.0/folder?projectKey={TARGET_PROJECT_KEY}&maxResults=1000"
+            for attempt in range(3):
+                resp = session.get(list_url, timeout=30)
+                if resp.status_code == 500:
+                    print(f"⚠️ Folder list 500 for {current_path}, retrying ({attempt+1}/3)...")
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                break
+
+            if not resp.ok:
+                print(f"⚠️ Folder list failed ({resp.status_code}): {resp.text[:120]}")
+                print(f"🩹 Skipping folder creation for {current_path} (lazy mode active).")
+                FOLDER_CACHE.add(current_path)
+                continue
+
+            existing = [f["name"] for f in resp.json().get("values", [])]
+            if part in existing:
+                FOLDER_CACHE.add(current_path)
+                continue
+
+            payload = {"name": part, "projectKey": TARGET_PROJECT_KEY, "type": "TEST_RUN"}
+            create_url = f"{TARGET_BASE_URL}/rest/atm/1.0/folder"
+            resp = session.post(create_url, json=payload, timeout=30)
+            if resp.ok:
+                print(f"📁 Created folder: {current_path}")
+                FOLDER_CACHE.add(current_path)
+            else:
+                print(f"⚠️ Failed to create folder '{current_path}': {resp.status_code} {resp.text[:150]}")
+                FOLDER_CACHE.add(current_path)
+        return folder_path
+    except Exception as e:
+        print(f"⚠️ Folder creation error for {folder_path}: {e}")
+        FOLDER_CACHE.add(folder_path)
+        return None
+
+
+def ensure_version_exists(version_name):
+    """Ensure a Jira version exists for the project."""
+    if not version_name:
+        return None
+    try:
+        versions_url = f"{TARGET_BASE_URL}/rest/api/2/project/{TARGET_PROJECT_KEY}/versions"
+        resp = session.get(versions_url, timeout=30)
+        if resp.ok:
+            if any(v["name"] == version_name for v in resp.json()):
+                return version_name
+
+        payload = {"name": version_name, "project": TARGET_PROJECT_KEY}
+        create_url = f"{TARGET_BASE_URL}/rest/api/2/version"
+        resp = session.post(create_url, json=payload, timeout=30)
+        if resp.ok:
+            print(f"🏷️ Created Jira version: {version_name}")
+            return version_name
+        else:
+            print(f"⚠️ Could not create version {version_name}: {resp.status_code} {resp.text[:150]}")
+    except Exception as e:
+        print(f"⚠️ Version creation error for {version_name}: {e}")
+    return None
+
+
+# ======= IMPORT HELPERS ==========
+
+def prepare_for_import(tc):
+    """Remap and validate test case for Zephyr import."""
+    tc["projectKey"] = TARGET_PROJECT_KEY
+    if "summary" in tc and "name" not in tc:
+        tc["name"] = tc.pop("summary")
+    if not tc.get("description") and tc.get("testScript", {}).get("text"):
+        tc["description"] = tc["testScript"]["text"]
+    if "testScript" not in tc or not isinstance(tc["testScript"], dict):
+        tc["testScript"] = {"type": "STEP_BY_STEP", "steps": []}
+    if not tc.get("name"):
+        tc["name"] = "(unnamed test)"
+    return tc
+
+
+def prune_unrecognized_fields(obj, allowed_fields):
+    return {k: v for k, v in obj.items() if k in allowed_fields}
+
+
+def create_testcase(tc):
+    # Pruning removes fields that:
+    # 1. Are auto-generated by Zephyr (id, key, createdOn, etc.) - already cleaned in step 2
+    # 2. Are not accepted by Zephyr Scale import API
+    # 3. Would cause import errors if included
+    allowed_fields = [
+        "name", "projectKey", "objective", "precondition", "priority",
+        "labels", "componentNames", "testScript", "estimatedTime", "customFields",
+        "folder",  # Preserves folder path for proper nesting
+        "status"  # Preserves test case status (Draft, Approved, etc.)
+    ]
+    tc_clean = prune_unrecognized_fields(tc, allowed_fields)
+    r = session.post(TC_POST, json=tc_clean, timeout=30)
+    if not r.ok:
+        print(f"❌ Failed to create test case: {r.status_code} {r.text[:200]}")
+    else:
+        print(f"✅ Created Test Case: {tc_clean.get('name')}")
+    return r.json() if r.ok else None
+
+
+def create_testplan(plan):
+    plan["projectKey"] = TARGET_PROJECT_KEY
+    r = session.post(PLAN_POST, json=plan, timeout=30)
+    if not r.ok:
+        print(f"❌ Failed to create test plan: {r.status_code} {r.text[:200]}")
+    else:
+        print(f"✅ Created Test Plan: {plan.get('name')}")
+    return r.json() if r.ok else None
+
+
+def create_testrun(run):
+    try:
+        r = session.post(RUN_POST, json=run, timeout=30)
+        if r.status_code == 201:
+            print(f"✅ Created Test Run: {run.get('name', '(unnamed)')}")
+            return
+
+        if r.status_code == 400 and "not found for field" in r.text:
+            text = r.text.lower()
+            if "folder" in text:
+                folder_path = run.get("folder")
+                if folder_path:
+                    print(f"🩹 Skipping folder creation for {folder_path} (lazy mode active).")
+                    run["folder"] = None
+            if "version" in text:
+                ensure_version_exists(run.get("version"))
+            print("🔁 Retrying test run creation after creating missing folder/version...")
+            r = session.post(RUN_POST, json=run, timeout=30)
+            if r.status_code == 201:
+                print(f"✅ Created Test Run (after fix): {run.get('name', '(unnamed)')}")
+                return
+        print(f"❌ Failed to create test run: {r.status_code} {r.text[:250]}")
+    except Exception as e:
+        print(f"💥 Error creating test run: {e}")
+
+
+def verify_jira_connection():
+    test_url = f"{TARGET_BASE_URL}/rest/api/2/serverInfo"
+    print(f"🌐 Testing connection to {test_url} ...")
+    try:
+        r = session.get(test_url, timeout=15)
+        r.raise_for_status()
+        print("✅ Jira connection OK:", r.json().get("baseUrl"))
+    except Exception as e:
+        raise SystemExit(f"❌ Failed to connect to Jira at {TARGET_BASE_URL}: {e}")
+
+
+def main():
+    verify_jira_connection()
+
+    with open(IN_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    print("▶ Importing Test Cases ...")
+    for tc in data.get("testCases", []):
+        tc_ready = prepare_for_import(tc)
+        create_testcase(tc_ready)
+
+    # Test Plans and Test Runs are imported in steps 8 and 11
+    # Do NOT import them here to avoid duplicates
+
+    print("✅ Import completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
