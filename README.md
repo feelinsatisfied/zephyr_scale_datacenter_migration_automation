@@ -50,8 +50,7 @@ The migration runs in three phases:
 
 1. Clone the repository to `~/Desktop/zephyr`:
    ```bash
-   git clone https://github.com/feelinsatisfied/zephyr_scale_datacenter_migration_automation ~/Desktop/zephyr
-   cd ~/Desktop/zephyr
+   git clone https://github.com/feelinsatisfied/zephyr_scale_datacenter_migration_automation.git ~/Desktop/zephyr
    ```
 
 2. Install dependencies:
