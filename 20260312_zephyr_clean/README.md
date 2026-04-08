@@ -10,7 +10,7 @@ When you export and import Zephyr Scale data between Jira instances, all entitie
 
 This tool uses content-based signature matching to build key mappings after import. Since keys change but content stays the same, we can match entities by their attributes and remap all references automatically.
 
-**Test cases** are matched by: name, description/objective, and first two test steps
+**Test cases** are matched by: name, description/objective, and first two test steps 
 
 **Test runs** are matched by: name, description, environment, version, and item count
 
